@@ -69,8 +69,8 @@ grep -q fdeserialize "$EVIDENCE/cpu-restart.trace"
 assert_absent -q cuvs_ "$EVIDENCE/cpu-restart.trace"
 tail -c +$((offset + 1)) "$HOST_RUN/log/seekdb.log" > "$EVIDENCE/lifecycle.log"
 grep -a 'serialized GPU CAGRA snapshot' "$EVIDENCE/lifecycle.log" > "$EVIDENCE/gpu.log"
-grep -aq 'built=true' "$EVIDENCE/gpu.log"
-grep -aq 'has_graph=true' "$EVIDENCE/gpu.log"
+grep -a ' serialized GPU CAGRA snapshot' "$EVIDENCE/gpu.log" | grep -aq 'built=true'
+grep -a 'deserialized GPU CAGRA snapshot' "$EVIDENCE/gpu.log" | grep -aqE 'graph_bytes=[1-9]'
 assert_absent -aq 'lazily built VSAG fallback' "$EVIDENCE/lifecycle.log"
 first_id=$(docker exec "$CONTAINER" head -n 1 "$BASE_TSV" | cut -f1)
 [[ "$first_id" =~ ^-?[0-9]+$ ]]
