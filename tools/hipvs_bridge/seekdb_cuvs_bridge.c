@@ -97,6 +97,52 @@ void seekdb_cuvs_free(void* handle)
   free(h);
 }
 
+int seekdb_cuvs_serialize(void* handle, const char* filename)
+{
+  sk_cuvs_index* index = (sk_cuvs_index*)handle;
+  if (!index || !filename) return 1;
+  if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
+    fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
+    return 1;
+  }
+  return 0;
+}
+
+void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
+{
+  if (!filename || n <= 0 || dim <= 0) return NULL;
+  sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
+  if (!index) return NULL;
+  if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
+  if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
+  if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
+  if (cuvsCagraDeserialize(index->res, filename, index->idx) != CUVS_SUCCESS) goto fail_idx;
+  {
+    int64_t actual_n = 0;
+    int64_t actual_dim = 0;
+    if (cuvsCagraIndexGetSize(index->idx, &actual_n) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetDims(index->idx, &actual_dim) != CUVS_SUCCESS ||
+        actual_n != n || actual_dim != dim) {
+      fprintf(stderr, "[seekdb_cuvs] snapshot shape mismatch: %ld x %ld, expected %ld x %ld\n",
+              (long)actual_n, (long)actual_dim, n, dim);
+      goto fail_idx;
+    }
+  }
+  index->n = n;
+  index->dim = dim;
+  return index;
+fail_idx:
+  cuvsCagraIndexDestroy(index->idx);
+fail_ip:
+  cuvsCagraIndexParamsDestroy(index->ip);
+fail_res:
+  cuvsResourcesDestroy(index->res);
+fail:
+  fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
+  free(index);
+  return NULL;
+}
+
 int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,
                           const float* query, long nq, long topk,
                           unsigned int* out_ids)
