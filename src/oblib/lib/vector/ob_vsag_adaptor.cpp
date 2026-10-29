@@ -226,6 +226,73 @@ static void *ob_cuvs_raw_batch_job(void *arg) {
 
 static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 
+// [AMD contest optimization] Reusable big-stack GPU worker. cuVS build/search
+// need a ~32MB stack, so the frozen baseline spawns (and joins) a fresh pthread
+// per GPU operation; the spawn/join fixed cost is visible in single-query P50/P95
+// and in the first query that triggers a build. This worker thread is created
+// lazily once and reused for every GPU job (callers already serialize GPU work
+// behind g_ob_cuvs_mu). On pthread_create failure we transparently fall back to
+// the baseline per-job thread, so behavior never regresses.
+namespace {
+struct ObCuvsWorker {
+  pthread_t tid_ = 0;
+  pthread_mutex_t mu_ = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t cv_work_ = PTHREAD_COND_INITIALIZER;
+  pthread_cond_t cv_done_ = PTHREAD_COND_INITIALIZER;
+  void *(*fn_)(void *) = nullptr;
+  void *arg_ = nullptr;
+  bool has_work_ = false;
+  int started_ = 0;  // 0=not tried, 1=running, -1=failed
+
+  static void *main_(void *self_raw) {
+    ObCuvsWorker *w = static_cast<ObCuvsWorker *>(self_raw);
+    for (;;) {
+      pthread_mutex_lock(&w->mu_);
+      while (!w->has_work_) { pthread_cond_wait(&w->cv_work_, &w->mu_); }
+      void *(*fn)(void *) = w->fn_; void *arg = w->arg_;
+      pthread_mutex_unlock(&w->mu_);
+      fn(arg);
+      pthread_mutex_lock(&w->mu_);
+      w->has_work_ = false;
+      pthread_cond_signal(&w->cv_done_);
+      pthread_mutex_unlock(&w->mu_);
+    }
+    return nullptr;
+  }
+
+  // Runs fn(arg) on the worker and waits for completion. Returns false when the
+  // worker could not be started (caller should use a per-job pthread instead).
+  bool run(void *(*fn)(void *), void *arg) {
+    pthread_mutex_lock(&mu_);
+    if (started_ == 0) {
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+      started_ = (pthread_create(&tid_, &attr, main_, this) == 0) ? 1 : -1;
+      pthread_attr_destroy(&attr);
+    }
+    if (started_ != 1) { pthread_mutex_unlock(&mu_); return false; }
+    fn_ = fn; arg_ = arg; has_work_ = true;
+    pthread_cond_signal(&cv_work_);
+    while (has_work_) { pthread_cond_wait(&cv_done_, &mu_); }
+    pthread_mutex_unlock(&mu_);
+    return true;
+  }
+};
+static ObCuvsWorker g_ob_cuvs_worker;
+
+// Runs a GPU job on the reusable worker; falls back to the frozen baseline's
+// per-job 32MB pthread when the worker is unavailable.
+static void ob_cuvs_dispatch(void *(*fn)(void *), void *arg) {
+  if (g_ob_cuvs_worker.run(fn, arg)) { return; }
+  pthread_t tid; pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  if (pthread_create(&tid, &attr, fn, arg) == 0) { pthread_join(tid, nullptr); }
+  pthread_attr_destroy(&attr);
+}
+}  // namespace
+
 static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *query, int /*dim*/, int64_t topk,
                                const float *&dist, const int64_t *&ids,
@@ -244,10 +311,7 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  ob_cuvs_dispatch(ob_cuvs_job, &job);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
@@ -1755,10 +1819,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
   std::vector<float> dst(static_cast<size_t>(nq) * topk);
   ObCuvsBatchJob job{ent, queries, nq, topk, n, need_build,
                      off.data(), dst.data(), 0, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  ob_cuvs_dispatch(ob_cuvs_batch_job, &job);
   if (job.built_) { ob_vsag_trace("cuvs_batch_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (job.served_ != nq) { return 0; }
   for (long q = 0; q < nq; ++q) {
@@ -1785,10 +1846,7 @@ long cuvs_batch_knn(const float *base, long n, long dim,
   if (base == nullptr || query == nullptr || out_ids == nullptr ||
       out_dist == nullptr || n <= 0 || dim <= 0 || nq <= 0 || topk <= 0) { return 0; }
   ObCuvsRawBatchJob job{base, n, dim, query, nq, topk, out_ids, out_dist, 0};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_raw_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  ob_cuvs_dispatch(ob_cuvs_raw_batch_job, &job);
   ob_vsag_trace("cuvs_raw_batch", base, nq, topk);
   return job.served_;
 }
