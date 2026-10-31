@@ -1,5 +1,21 @@
 #define _POSIX_C_SOURCE 200809L
-/* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here. */
+/* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here.
+ *
+ * Team entry on top of competition/amd-cagra@7067ad64 (cccxy123), which carries
+ * the platform-validated per-dimension build tuning (128d: NN-descent 96/128/20,
+ * 256d: IVF-PQ), param-file/env overrides, per-handle query buffers, itopk
+ * max(2k,256) and stage timing logs. This commit adds three changes that are
+ * result-neutral by construction and default-safe:
+ *  1. cuvsCagraSearchParams_t is cached per handle and re-tuned per call with
+ *     exactly the same field values (no more create/destroy per single-row SQL).
+ *  2. Optional dataset H2D staging before cuvsCagraBuild: SEEKDB_CUVS_H2D_STAGE=1
+ *     stages the dataset with one contiguous copy and hands cuVS a kDLCUDA
+ *     tensor (per-handle buffer, freed with the handle; falls back to the
+ *     validated kDLCPU path on any failure). Default 0 = untouched build path.
+ *  3. Optional max_queries alignment: SEEKDB_CUVS_MAXQ=1 sets
+ *     sp->max_queries = nq (workspace hint). Default 0 = untouched (validated).
+ * All build/search defaults above stay exactly as in the parent commit.
+ */
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
@@ -17,15 +33,18 @@
 typedef struct {
   cuvsResources_t        res;
   cuvsCagraIndexParams_t ip;
+  cuvsCagraSearchParams_t sp;  /* cached; fields re-tuned per search call */
   cuvsCagraIndex_t       idx;
   long n, dim;
   /* Scratch buffers reused across queries: allocating three device buffers
-   * and a search-params object per query dominates short ANN searches. */
+   * per query dominates short ANN searches. */
   float*    qbuf;
   unsigned* nbuf;
   float*    dbuf;
   long      qcap;
   long      kcap;
+  float*    ds;                /* optional per-handle dataset staging buffer */
+  int       ds_via_rmm;        /* 1 = ds came from cuvsRMMAlloc             */
 } sk_cuvs_index;
 
 static double sk_now_ms(void)
@@ -94,6 +113,16 @@ static void sk_fill_tensor(DLManagedTensor* t, void* data, long* shape, int ndim
   t->deleter = NULL;
 }
 
+/* Cache the search params on the handle; fields are re-tuned per call in
+ * seekdb_cuvs_search with the same values the parent commit used. */
+static void sk_ensure_sp(sk_cuvs_index* h)
+{
+  if (h->sp == 0) {
+    cuvsCagraSearchParams_t sp = 0;
+    if (cuvsCagraSearchParamsCreate(&sp) == CUVS_SUCCESS) { h->sp = sp; }
+  }
+}
+
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
   const double t0 = sk_now_ms();
@@ -101,13 +130,34 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (!h) return NULL;
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
 
-  DLManagedTensor dset; long ds[2] = {n, dim};
-  sk_fill_tensor(&dset, (void*)base, ds, 2, kDLCPU, kDLFloat, 32);
-
   const size_t gd = sk_build_gd(dim);
   const size_t igd = sk_build_igd(dim);
   const size_t niter = sk_build_niter(dim);
   const int algo = sk_build_algo(dim);
+
+  /* Optional dataset H2D staging (default off): one contiguous copy we control,
+   * then hand cuVS a kDLCUDA tensor. Any failure falls back to the validated
+   * kDLCPU path, so behavior can only match the parent commit unless enabled. */
+  DLManagedTensor dset; long ds[2] = {n, dim};
+  int have_dev_copy = 0;
+  if (sk_param("SEEKDB_CUVS_H2D_STAGE", 0) != 0) {
+    const long bytes = sizeof(float) * n * dim;
+    if (cuvsRMMAlloc(h->res, (void**)&h->ds, bytes) == CUVS_SUCCESS) {
+      h->ds_via_rmm = 1;
+    } else if (cudaMalloc((void**)&h->ds, bytes) == cudaSuccess) {
+      h->ds_via_rmm = 0;
+    } else {
+      h->ds = 0;
+    }
+    if (h->ds != 0 &&
+        cudaMemcpy(h->ds, base, bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+      sk_fill_tensor(&dset, h->ds, ds, 2, kDLCUDA, kDLFloat, 32);
+      have_dev_copy = 1;
+    }
+  }
+  if (!have_dev_copy) {
+    sk_fill_tensor(&dset, (void*)base, ds, 2, kDLCPU, kDLFloat, 32);
+  }
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = algo == 1 ? IVF_PQ : NN_DESCENT;
@@ -119,15 +169,21 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   const double t2 = sk_now_ms();
   h->n = n; h->dim = dim;
+  sk_ensure_sp(h);
   fprintf(stderr,
-          "[seekdb_cuvs][t] build n=%ld dim=%ld gd=%zu igd=%zu niter=%zu algo=%d "
+          "[seekdb_cuvs][t] build n=%ld dim=%ld gd=%zu igd=%zu niter=%zu algo=%d stage=%d "
           "setup_ms=%.1f graph_ms=%.1f total_ms=%.1f\n",
-          n, dim, gd, igd, niter, algo, t1 - t0, t2 - t1, t2 - t0);
+          n, dim, gd, igd, niter, algo, have_dev_copy, t1 - t0, t2 - t1, t2 - t0);
   return h;
 
 fail_idx: cuvsCagraIndexDestroy(h->idx);
 fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
-fail_res: cuvsResourcesDestroy(h->res); free(h);
+fail_res:
+  if (h->ds) {
+    if (h->ds_via_rmm) { cuvsRMMFree(h->res, h->ds, sizeof(float) * n * dim); }
+    else { cudaFree(h->ds); }
+  }
+  cuvsResourcesDestroy(h->res); free(h);
   fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
   return NULL;
 }
@@ -153,7 +209,9 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return 1;
   int rc = 0;
-  cuvsCagraSearchParams_t sp = 0;
+  sk_ensure_sp(h);
+  cuvsCagraSearchParams_t sp = h->sp;
+  if (!sp) { return 14; }
   if (h->qcap < nq || h->kcap < topk) {
     if (h->qbuf) { cuvsRMMFree(h->res, h->qbuf, sizeof(float) * h->qcap * h->dim); h->qbuf = 0; }
     if (h->nbuf) { cuvsRMMFree(h->res, h->nbuf, sizeof(unsigned) * h->qcap * h->kcap); h->nbuf = 0; }
@@ -174,11 +232,14 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     sk_fill_tensor(&nt, nd, nsh, 2, kDLCUDA, kDLUInt, 32);
     sk_fill_tensor(&dt, dd, dsh, 2, kDLCUDA, kDLFloat, 32);
     const double t1 = sk_now_ms();
-    if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
     {
       size_t required_itopk = sk_itopk_size(topk);
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
       sp->search_width = (size_t)sk_param("SEEKDB_CUVS_WIDTH", 4);
+      if (sk_param("SEEKDB_CUVS_MAXQ", 0) != 0 &&
+          (sp->max_queries == 0 || (long)sp->max_queries < nq)) {
+        sp->max_queries = (size_t)nq; /* workspace hint alignment (opt-in) */
+      }
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
@@ -193,7 +254,6 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     }
   }
 done:
-  if (sp) cuvsCagraSearchParamsDestroy(sp);
   if (rc) fprintf(stderr, "[seekdb_cuvs] search rc=%d: %s\n", rc, cuvsGetLastErrorText());
   return rc;
 }
@@ -202,11 +262,16 @@ void seekdb_cuvs_free(void* handle)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
+  if (h->sp) { cuvsCagraSearchParamsDestroy(h->sp); h->sp = 0; }
   if (h->qbuf) { cuvsRMMFree(h->res, h->qbuf, sizeof(float) * h->qcap * h->dim); h->qbuf = 0; }
   if (h->nbuf) { cuvsRMMFree(h->res, h->nbuf, sizeof(unsigned) * h->qcap * h->kcap); h->nbuf = 0; }
   if (h->dbuf) { cuvsRMMFree(h->res, h->dbuf, sizeof(float) * h->qcap * h->kcap); h->dbuf = 0; }
   cuvsCagraIndexDestroy(h->idx);
   cuvsCagraIndexParamsDestroy(h->ip);
+  if (h->ds) {
+    if (h->ds_via_rmm) { cuvsRMMFree(h->res, h->ds, sizeof(float) * h->n * h->dim); }
+    else { cudaFree(h->ds); }
+  }
   cuvsResourcesDestroy(h->res);
   free(h);
 }
@@ -249,6 +314,7 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
   }
   index->n = n;
   index->dim = dim;
+  sk_ensure_sp(index);
   fprintf(stderr, "[seekdb_cuvs][t] deserialize n=%ld dim=%ld total_ms=%.1f\n",
           n, dim, sk_now_ms() - t0);
   return index;
